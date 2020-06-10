@@ -1,4 +1,5 @@
 #include "blas.h"
+#include "utils.h"
 
 #include <math.h>
 #include <assert.h>
@@ -34,7 +35,7 @@ void reorg_cpu(float *x, int out_w, int out_h, int out_c, int batch, int stride,
 
 void flatten(float *x, int size, int layers, int batch, int forward)
 {
-    float* swap = (float*)calloc(size * layers * batch, sizeof(float));
+    float* swap = (float*)xcalloc(size * layers * batch, sizeof(float));
     int i,c,b;
     for(b = 0; b < batch; ++b){
         for(c = 0; c < layers; ++c){
@@ -65,6 +66,161 @@ void weighted_delta_cpu(float *a, float *b, float *s, float *da, float *db, floa
         if(da) da[i] += dc[i] * s[i];
         if(db) db[i] += dc[i] * (1-s[i]);
         ds[i] += dc[i] * (a[i] - b[i]);
+    }
+}
+
+static float relu(float src) {
+    if (src > 0) return src;
+    return 0;
+}
+
+void shortcut_multilayer_cpu(int size, int src_outputs, int batch, int n, int *outputs_of_layers, float **layers_output, float *out, float *in, float *weights, int nweights, WEIGHTS_NORMALIZATION_T weights_normalization)
+{
+    // nweights - l.n or l.n*l.c or (l.n*l.c*l.h*l.w)
+    const int layer_step = nweights / (n + 1);    // 1 or l.c or (l.c * l.h * l.w)
+    int step = 0;
+    if (nweights > 0) step = src_outputs / layer_step; // (l.c * l.h * l.w) or (l.w*l.h) or 1
+
+    int id;
+    #pragma omp parallel for
+    for (id = 0; id < size; ++id) {
+
+        int src_id = id;
+        const int src_i = src_id % src_outputs;
+        src_id /= src_outputs;
+        int src_b = src_id;
+
+        float sum = 1, max_val = -FLT_MAX;
+        int i;
+        if (weights && weights_normalization) {
+            if (weights_normalization == SOFTMAX_NORMALIZATION) {
+                for (i = 0; i < (n + 1); ++i) {
+                    const int weights_index = src_i / step + i*layer_step;  // [0 or c or (c, h ,w)]
+                    float w = weights[weights_index];
+                    if (max_val < w) max_val = w;
+                }
+            }
+            const float eps = 0.0001;
+            sum = eps;
+            for (i = 0; i < (n + 1); ++i) {
+                const int weights_index = src_i / step + i*layer_step;  // [0 or c or (c, h ,w)]
+                const float w = weights[weights_index];
+                if (weights_normalization == RELU_NORMALIZATION) sum += relu(w);
+                else if (weights_normalization == SOFTMAX_NORMALIZATION) sum += expf(w - max_val);
+            }
+        }
+
+        if (weights) {
+            float w = weights[src_i / step];
+            if (weights_normalization == RELU_NORMALIZATION) w = relu(w) / sum;
+            else if (weights_normalization == SOFTMAX_NORMALIZATION) w = expf(w - max_val) / sum;
+
+            out[id] = in[id] * w; // [0 or c or (c, h ,w)]
+        }
+        else out[id] = in[id];
+
+        // layers
+        for (i = 0; i < n; ++i) {
+            int add_outputs = outputs_of_layers[i];
+            if (src_i < add_outputs) {
+                int add_index = add_outputs*src_b + src_i;
+                int out_index = id;
+
+                float *add = layers_output[i];
+
+                if (weights) {
+                    const int weights_index = src_i / step + (i + 1)*layer_step;  // [0 or c or (c, h ,w)]
+                    float w = weights[weights_index];
+                    if (weights_normalization == RELU_NORMALIZATION) w = relu(w) / sum;
+                    else if (weights_normalization == SOFTMAX_NORMALIZATION) w = expf(w - max_val) / sum;
+
+                    out[out_index] += add[add_index] * w; // [0 or c or (c, h ,w)]
+                }
+                else out[out_index] += add[add_index];
+            }
+        }
+    }
+}
+
+void backward_shortcut_multilayer_cpu(int size, int src_outputs, int batch, int n, int *outputs_of_layers,
+    float **layers_delta, float *delta_out, float *delta_in, float *weights, float *weight_updates, int nweights, float *in, float **layers_output, WEIGHTS_NORMALIZATION_T weights_normalization)
+{
+    // nweights - l.n or l.n*l.c or (l.n*l.c*l.h*l.w)
+    const int layer_step = nweights / (n + 1);    // 1 or l.c or (l.c * l.h * l.w)
+    int step = 0;
+    if (nweights > 0) step = src_outputs / layer_step; // (l.c * l.h * l.w) or (l.w*l.h) or 1
+
+    int id;
+    #pragma omp parallel for
+    for (id = 0; id < size; ++id) {
+        int src_id = id;
+        int src_i = src_id % src_outputs;
+        src_id /= src_outputs;
+        int src_b = src_id;
+
+        float grad = 1, sum = 1, max_val = -FLT_MAX;;
+        int i;
+        if (weights && weights_normalization) {
+            if (weights_normalization == SOFTMAX_NORMALIZATION) {
+                for (i = 0; i < (n + 1); ++i) {
+                    const int weights_index = src_i / step + i*layer_step;  // [0 or c or (c, h ,w)]
+                    float w = weights[weights_index];
+                    if (max_val < w) max_val = w;
+                }
+            }
+            const float eps = 0.0001;
+            sum = eps;
+            for (i = 0; i < (n + 1); ++i) {
+                const int weights_index = src_i / step + i*layer_step;  // [0 or c or (c, h ,w)]
+                const float w = weights[weights_index];
+                if (weights_normalization == RELU_NORMALIZATION) sum += relu(w);
+                else if (weights_normalization == SOFTMAX_NORMALIZATION) sum += expf(w - max_val);
+            }
+
+            /*
+            grad = 0;
+            for (i = 0; i < (n + 1); ++i) {
+                const int weights_index = src_i / step + i*layer_step;  // [0 or c or (c, h ,w)]
+                const float delta_w = delta_in[id] * in[id];
+                const float w = weights[weights_index];
+                if (weights_normalization == RELU_NORMALIZATION) grad += delta_w * relu(w) / sum;
+                else if (weights_normalization == SOFTMAX_NORMALIZATION) grad += delta_w * expf(w - max_val) / sum;
+            }
+            */
+        }
+
+        if (weights) {
+            float w = weights[src_i / step];
+            if (weights_normalization == RELU_NORMALIZATION) w = relu(w) / sum;
+            else if (weights_normalization == SOFTMAX_NORMALIZATION) w = expf(w - max_val) / sum;
+
+            delta_out[id] += delta_in[id] * w; // [0 or c or (c, h ,w)]
+            weight_updates[src_i / step] += delta_in[id] * in[id] * grad;
+        }
+        else delta_out[id] += delta_in[id];
+
+        // layers
+        for (i = 0; i < n; ++i) {
+            int add_outputs = outputs_of_layers[i];
+            if (src_i < add_outputs) {
+                int add_index = add_outputs*src_b + src_i;
+                int out_index = id;
+
+                float *layer_delta = layers_delta[i];
+                if (weights) {
+                    float *add = layers_output[i];
+
+                    const int weights_index = src_i / step + (i + 1)*layer_step;  // [0 or c or (c, h ,w)]
+                    float w = weights[weights_index];
+                    if (weights_normalization == RELU_NORMALIZATION) w = relu(w) / sum;
+                    else if (weights_normalization == SOFTMAX_NORMALIZATION) w = expf(w - max_val) / sum;
+
+                    layer_delta[add_index] += delta_in[id] * w; // [0 or c or (c, h ,w)]
+                    weight_updates[weights_index] += delta_in[id] * add[add_index] * grad;
+                }
+                else layer_delta[add_index] += delta_in[id];
+            }
+        }
     }
 }
 
@@ -133,7 +289,7 @@ void normalize_cpu(float *x, float *mean, float *variance, int batch, int filter
         for(f = 0; f < filters; ++f){
             for(i = 0; i < spatial; ++i){
                 int index = b*filters*spatial + f*spatial + i;
-                x[index] = (x[index] - mean[f])/(sqrt(variance[f]) + .000001f);
+                x[index] = (x[index] - mean[f])/(sqrt(variance[f] + .000001f));
             }
         }
     }
@@ -167,6 +323,12 @@ void scal_cpu(int N, float ALPHA, float *X, int INCX)
 {
     int i;
     for(i = 0; i < N; ++i) X[i*INCX] *= ALPHA;
+}
+
+void scal_add_cpu(int N, float ALPHA, float BETA, float *X, int INCX)
+{
+    int i;
+    for (i = 0; i < N; ++i) X[i*INCX] = X[i*INCX] * ALPHA + BETA;
 }
 
 void fill_cpu(int N, float ALPHA, float *X, int INCX)
@@ -329,6 +491,119 @@ void upsample_cpu(float *in, int w, int h, int c, int batch, int stride, int for
                     int out_index = b*w*h*c*stride*stride + k*w*h*stride*stride + j*w*stride + i;
                     if (forward) out[out_index] = scale*in[in_index];
                     else in[in_index] += scale*out[out_index];
+                }
+            }
+        }
+    }
+}
+
+
+void constrain_cpu(int size, float ALPHA, float *X)
+{
+    int i;
+    for (i = 0; i < size; ++i) {
+        X[i] = fminf(ALPHA, fmaxf(-ALPHA, X[i]));
+    }
+}
+
+void fix_nan_and_inf_cpu(float *input, size_t size)
+{
+    int i;
+    for (i = 0; i < size; ++i) {
+        float val = input[i];
+        if (isnan(val) || isinf(val))
+            input[i] = 1.0f / i;  // pseudo random value
+    }
+}
+
+
+float cosine_similarity(float *A, float *B, unsigned int feature_size)
+{
+    float mul = 0.0, d_a = 0.0, d_b = 0.0;
+
+    int i;
+    for(i = 0; i < feature_size; ++i)
+    {
+        mul += A[i] * B[i];
+        d_a += A[i] * A[i];
+        d_b += B[i] * B[i];
+    }
+    float similarity;
+    float divider = sqrt(d_a) * sqrt(d_b);
+    if (divider > 0) similarity = mul / divider;
+    else similarity = 0;
+
+    return similarity;
+}
+
+// num_of_samples = 2 * loaded_images = mini_batch_size
+
+float P_constrastive(int i, int l, int *labels, int num_of_samples, float **z, unsigned int feature_size, float temperature)
+{
+    if (i == l) {
+        printf(" Error: in P_constrastive must be i != l, while i = %d, l = %d \n", i, l);
+        getchar();
+    }
+
+    const float sim = cosine_similarity(z[i], z[l], feature_size);
+    const float numerator = expf(sim / temperature);
+
+    float denominator = 0;
+    int k;
+    for (k = 0; k < num_of_samples; ++k) {
+        //if (k != i && labels[k] != labels[i]) {
+        if (k != i) {
+            const float sim_den = cosine_similarity(z[k], z[l], feature_size);
+            denominator += expf(sim_den / temperature);
+        }
+    }
+
+    float result = numerator / denominator;
+    return result;
+}
+
+// i - id of the current sample in mini_batch
+// labels[num_of_samples] - array with class_id for each sample in the current mini_batch
+// z[feature_size][num_of_samples] - array of arrays with contrastive features (output of conv-layer, f.e. 128 floats for each sample)
+// delta[feature_size] - array with deltas for backpropagation
+// temperature - scalar temperature param (temperature > 0), f.e. temperature = 0.07: Supervised Contrastive Learning
+void grad_contrastive_loss_positive(int i, int *labels, int num_of_samples, float **z, unsigned int feature_size, float temperature, float *delta)
+{
+    int j;
+    for (j = 0; j < num_of_samples; ++j) {
+        if (i != j && labels[i] == labels[j]) {
+            const float sim = cosine_similarity(z[i], z[j], feature_size);
+            const float P = P_constrastive(i, j, labels, num_of_samples, z, feature_size, temperature);
+
+            int m;
+            for (m = 0; m < feature_size; ++m) {
+                delta[m] += (sim * z[i][m] - z[j][m]) * (1 - P);
+            }
+        }
+    }
+}
+
+// i - id of the current sample in mini_batch
+// labels[num_of_samples] - array with class_id for each sample in the current mini_batch
+// z[feature_size][num_of_samples] - array of arrays with contrastive features (output of conv-layer, f.e. 128 floats for each sample)
+// delta[feature_size] - array with deltas for backpropagation
+// temperature - scalar temperature param (temperature > 0), f.e. temperature = 0.07: Supervised Contrastive Learning
+void grad_contrastive_loss_negative(int i, int *labels, int num_of_samples, float **z, unsigned int feature_size, float temperature, float *delta)
+{
+    int j;
+    for (j = 0; j < num_of_samples; ++j) {
+        if (i != j && labels[i] == labels[j]) {
+
+            int k;
+            for (k = 0; k < num_of_samples; ++k) {
+                if (k != i && k != j) {
+                    const float sim = cosine_similarity(z[i], z[k], feature_size);
+                    const float P = P_constrastive(i, k, labels, num_of_samples, z, feature_size, temperature);
+
+                    int m;
+                    for (m = 0; m < feature_size; ++m) {
+                        delta[m] += (z[k][m] - sim * z[i][m]) * P;
+                    }
                 }
             }
         }
